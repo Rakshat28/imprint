@@ -1,7 +1,18 @@
 [package]
-name = "imprint"
+name = "bdstorage"
 version = "0.1.0"
 edition = "2024"
+description = "A speed-first local data deduplication engine using tiered BLAKE3 hashing."
+license = "Apache-2.0"
+authors = ["Rakshat Pratap Singh"]
+repository = ""
+readme = "README.md"
+keywords = ["deduplication", "storage", "nvme", "blake3"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "imprint"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
