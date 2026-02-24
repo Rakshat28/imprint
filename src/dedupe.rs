@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use filetime::FileTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkType {
@@ -40,6 +42,21 @@ pub fn replace_with_link(master: &Path, target: &Path, allow_unsafe_hardlinks: b
         return Ok(None);
     }
 
+    // Capture target metadata before replacement
+    let target_meta = std::fs::metadata(target).with_context(|| "read target metadata")?;
+    let target_permissions = target_meta.permissions();
+    let target_mtime = FileTime::from_last_modification_time(&target_meta);
+    
+    // Capture extended attributes
+    let mut target_xattrs: Vec<(OsString, Vec<u8>)> = Vec::new();
+    if let Ok(attrs) = xattr::list(target) {
+        for attr_name in attrs {
+            if let Ok(Some(attr_value)) = xattr::get(target, &attr_name) {
+                target_xattrs.push((attr_name, attr_value));
+            }
+        }
+    }
+
     let mut temp = target.to_path_buf();
     temp.set_extension("imprint_tmp");
     if temp.exists() {
@@ -52,6 +69,10 @@ pub fn replace_with_link(master: &Path, target: &Path, allow_unsafe_hardlinks: b
         Ok(_) => {
             std::fs::rename(&temp, target).with_context(|| "replace target with reflink")?;
             cleanup.disarm();
+            
+            // Restore metadata
+            apply_metadata(target, &target_permissions, target_mtime, &target_xattrs)?;
+            
             Ok(Some(LinkType::Reflink))
         }
         Err(_) => {
@@ -64,6 +85,10 @@ pub fn replace_with_link(master: &Path, target: &Path, allow_unsafe_hardlinks: b
                 std::fs::hard_link(master, &temp).with_context(|| "create hard link")?;
                 std::fs::rename(&temp, target).with_context(|| "replace target with hard link")?;
                 cleanup.disarm();
+                
+                // Restore metadata
+                apply_metadata(target, &target_permissions, target_mtime, &target_xattrs)?;
+                
                 Ok(Some(LinkType::HardLink))
             } else {
                 // Safety first: refuse to create hardlinks without explicit permission
@@ -71,6 +96,28 @@ pub fn replace_with_link(master: &Path, target: &Path, allow_unsafe_hardlinks: b
             }
         }
     }
+}
+
+fn apply_metadata(
+    path: &Path,
+    permissions: &std::fs::Permissions,
+    mtime: FileTime,
+    xattrs: &[(OsString, Vec<u8>)],
+) -> Result<()> {
+    // Restore permissions
+    std::fs::set_permissions(path, permissions.clone())
+        .with_context(|| "restore file permissions")?;
+    
+    // Restore modification time
+    filetime::set_file_mtime(path, mtime)
+        .with_context(|| "restore file mtime")?;
+    
+    // Restore extended attributes (gracefully ignore unsupported errors)
+    for (attr_name, attr_value) in xattrs {
+        let _ = xattr::set(path, attr_name, attr_value);
+    }
+    
+    Ok(())
 }
 
 pub fn compare_files(path1: &Path, path2: &Path) -> Result<bool> {
@@ -102,6 +149,21 @@ pub fn compare_files(path1: &Path, path2: &Path) -> Result<bool> {
 }
 
 pub fn restore_file(target: &Path) -> Result<()> {
+    // Capture original metadata before restoration
+    let target_meta = std::fs::metadata(target).with_context(|| "read target metadata")?;
+    let target_permissions = target_meta.permissions();
+    let target_mtime = FileTime::from_last_modification_time(&target_meta);
+    
+    // Capture extended attributes
+    let mut target_xattrs: Vec<(OsString, Vec<u8>)> = Vec::new();
+    if let Ok(attrs) = xattr::list(target) {
+        for attr_name in attrs {
+            if let Ok(Some(attr_value)) = xattr::get(target, &attr_name) {
+                target_xattrs.push((attr_name, attr_value));
+            }
+        }
+    }
+
     let mut temp = target.to_path_buf();
     temp.set_extension("imprint_tmp");
     if temp.exists() {
@@ -116,14 +178,12 @@ pub fn restore_file(target: &Path) -> Result<()> {
         let mut dst = File::create(&temp).with_context(|| "create temp file")?;
         std::io::copy(&mut src, &mut dst).with_context(|| "copy bytes to temp file")?;
     }
-    
-    // Preserve original permissions
-    if let Ok(meta) = std::fs::metadata(target) {
-        let _ = std::fs::set_permissions(&temp, meta.permissions());
-    }
 
     std::fs::rename(&temp, target).with_context(|| "replace target with restored copy")?;
     cleanup.disarm();
+    
+    // Restore metadata
+    apply_metadata(target, &target_permissions, target_mtime, &target_xattrs)?;
     
     Ok(())
 }
