@@ -57,13 +57,13 @@ enum Commands {
         /// Allow unsafe hard links as fallback when CoW reflinks are not supported.
         /// WARNING: Hard links share the same inode without CoW semantics. Modifying
         /// one file will affect all linked copies and the vault master.
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = false)]
         allow_unsafe_hardlinks: bool,
     },
     /// Restore deduplicated files to their original independent state.
     ///
     /// Breaks links and copies data back from the vault to the original location.
-    /// If a vault file's reference count hits zero, it is pruned.
+    ///    cargo run -- dedupe ~/Desktop/experiment/ --help    cargo run -- dedupe ~/Desktop/experiment/ --help If a vault file's reference count hits zero, it is pruned.
     Restore {
         /// The directory to restore
         path: PathBuf,
@@ -249,6 +249,28 @@ fn dedupe_groups(
     allow_unsafe_hardlinks: bool,
 ) -> Result<()> {
     let mut reflink_warning_shown = false;
+    let mut warn_reflink_unsupported = |name: &str| {
+        if !reflink_warning_shown {
+            println!("\n{}", "━".repeat(80).yellow());
+            println!("{} Filesystem Does Not Support Copy-on-Write Reflinks", "[WARNING]".bold().yellow());
+            println!("{}", "━".repeat(80).yellow());
+            println!("\nYour filesystem does not support CoW (Copy-on-Write) reflinks.");
+            println!("Reflinks allow files to share disk space while remaining independent copies.");
+            println!("When you modify a reflinked file, only the changed portions use new disk space.\n");
+            println!("{}", "Why this matters:".bold());
+            println!("  • Reflinks are SAFE - editing one file doesn't affect others");
+            println!("  • Hard links share the SAME inode - editing one file changes ALL copies");
+            println!("  • With hard links, modifying any deduplicated file will corrupt your vault\n");
+            println!("{}", "Your options:".bold());
+            println!("  1. {} - Files will be skipped (current behavior)", "Do nothing".green());
+            println!("  2. {} - Use hard links at your own risk", "Add --allow-unsafe-hardlinks".yellow());
+            println!("  3. {} - Btrfs, XFS (Linux), APFS (macOS), ReFS (Windows)\n", "Switch to a reflink-capable filesystem".cyan());
+            println!("{}", "━".repeat(80).yellow());
+            println!();
+            reflink_warning_shown = true;
+        }
+        println!("{} {}", "[SKIPPED]".bold().red(), name);
+    };
     
     for (hash, paths) in groups {
         if paths.len() < 2 {
@@ -337,31 +359,8 @@ fn dedupe_groups(
                 Ok(None) => {}
                 Err(e) => {
                     if e.to_string().contains("reflink not supported") {
-                        if !reflink_warning_shown {
-                            println!("\n{}", "━".repeat(80).yellow());
-                            println!("{} Filesystem Does Not Support Copy-on-Write Reflinks", "[WARNING]".bold().yellow());
-                            println!("{}", "━".repeat(80).yellow());
-                            println!("\nYour filesystem does not support CoW (Copy-on-Write) reflinks.");
-                            println!("Reflinks allow files to share disk space while remaining independent copies.");
-                            println!("When you modify a reflinked file, only the changed portions use new disk space.\n");
-                            println!("{}", "Why this matters:".bold());
-                            println!("  • Reflinks are SAFE - editing one file doesn't affect others");
-                            println!("  • Hard links share the SAME inode - editing one file changes ALL copies");
-                            println!("  • With hard links, modifying any deduplicated file will corrupt your vault\n");
-                            println!("{}", "Your options:".bold());
-                            println!("  1. {} - Files will be skipped (current behavior)", "Do nothing".green());
-                            println!("  2. {} - Use hard links at your own risk", "Add --allow-unsafe-hardlinks".yellow());
-                            println!("  3. {} - Btrfs, XFS (Linux), APFS (macOS), ReFS (Windows)\n", "Switch to a reflink-capable filesystem".cyan());
-                            println!("{}", "━".repeat(80).yellow());
-                            println!();
-                            reflink_warning_shown = true;
-                        }
                         let name = display_name(master);
-                        println!(
-                            "{} {}",
-                            "[SKIPPED]".bold().red(),
-                            name
-                        );
+                        warn_reflink_unsupported(&name);
                         continue;
                     } else {
                         return Err(e);
@@ -439,31 +438,8 @@ fn dedupe_groups(
                     Ok(None) => {}
                     Err(e) => {
                         if e.to_string().contains("reflink not supported") {
-                            if !reflink_warning_shown {
-                                println!("\n{}", "━".repeat(80).yellow());
-                                println!("{} Filesystem Does Not Support Copy-on-Write Reflinks", "[WARNING]".bold().yellow());
-                                println!("{}", "━".repeat(80).yellow());
-                                println!("\nYour filesystem does not support CoW (Copy-on-Write) reflinks.");
-                                println!("Reflinks allow files to share disk space while remaining independent copies.");
-                                println!("When you modify a reflinked file, only the changed portions use new disk space.\n");
-                                println!("{}", "Why this matters:".bold());
-                                println!("  • Reflinks are SAFE - editing one file doesn't affect others");
-                                println!("  • Hard links share the SAME inode - editing one file changes ALL copies");
-                                println!("  • With hard links, modifying any deduplicated file will corrupt your vault\n");
-                                println!("{}", "Your options:".bold());
-                                println!("  1. {} - Files will be skipped (current behavior)", "Do nothing".green());
-                                println!("  2. {} - Use hard links at your own risk", "Add --allow-unsafe-hardlinks".yellow());
-                                println!("  3. {} - Btrfs, XFS (Linux), APFS (macOS), ReFS (Windows)\n", "Switch to a reflink-capable filesystem".cyan());
-                                println!("{}", "━".repeat(80).yellow());
-                                println!();
-                                reflink_warning_shown = true;
-                            }
                             let name = display_name(path);
-                            println!(
-                                "{} {}",
-                                "[SKIPPED]".bold().red(),
-                                name
-                            );
+                            warn_reflink_unsupported(&name);
                             continue;
                         } else {
                             return Err(e);
