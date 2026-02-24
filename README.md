@@ -35,8 +35,8 @@ When identical files are confirmed, `bdstorage` uses a **Content-Addressable Sto
 
 1. **Vaulting:** The first instance of a file (the "master") is moved into a hidden local vault. It is renamed to its BLAKE3 hash.
 2. **Linking:** `bdstorage` replaces the original file and any subsequent duplicates with a link pointing to the vaulted master.
-    * **Primary Strategy (Reflink):** Tries to create a Copy-on-Write (CoW) reflink. This is instantaneous and shares the underlying disk extents.
-    * **Fallback Strategy (Hard Link):** If the filesystem does not support reflinks, it falls back to standard hard links.
+    * **Primary Strategy (Reflink - Strict Default):** Creates a Copy-on-Write (CoW) reflink. This is instantaneous, shares the underlying disk extents, and preserves data independence. **If the filesystem does not support reflinks, the file is skipped by default to prevent data corruption.**
+    * **Opt-In Fallback (Hard Link):** Only available via the `--allow-unsafe-hardlinks` flag. Hard links share the same inode without CoW semantics. **WARNING:** Modifying one deduplicated file will unintentionally overwrite the master file in the CAS vault and all other duplicate files pointing to it. Use this option only if you understand the risks.
 3. **State Tracking:** An embedded, low-latency `redb` database tracks file metadata, vault index, and reference counts to ensure nothing is accidentally deleted.
 
 ---
@@ -74,7 +74,7 @@ bdstorage scan /path/to/directory
 ```
 
 ### 2. Dedupe (Write-Mode)
-Execute the deduplication process. Master files are vaulted, and duplicates are replaced with reflinks or hard links.
+Execute the deduplication process. Master files are vaulted, and duplicates are replaced with reflinks.
 ```bash
 bdstorage dedupe /path/to/directory
 ```
@@ -82,6 +82,7 @@ bdstorage dedupe /path/to/directory
 **Flags:**
 * `--paranoid`: Perform a strict byte-for-byte comparison against the vaulted file before linking to guarantee 100% collision safety and protect against bit rot.
 * `-n, --dry-run`: Simulate the deduplication process, printing what *would* happen without actually modifying the filesystem or database.
+* `--allow-unsafe-hardlinks`: **[USE WITH CAUTION]** Allow hard link fallback when the filesystem does not support CoW reflinks. Hard links share the same inode without copy-on-write semantics, meaning modifications to one file will affect all linked copies and the vault master. Only use this flag if you understand the mutation risks.
 
 ### 3. Restore (Un-Dedupe)
 Reverse the deduplication process. This breaks the shared links and restores independent, physical copies of the data back to their original locations.

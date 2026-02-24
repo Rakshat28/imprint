@@ -23,7 +23,7 @@ use crate::types::{FileMetadata, Hash};
     version,
     about = "bdstorage: A speed-first, local file deduplication engine.",
     long_about = "bdstorage uses a Tiered Hashing philosophy to minimize I/O overhead:\n\nSize Grouping: Eliminates unique file sizes immediately.\n\nSparse Hashing: Samples 12KB (start/middle/end) to identify candidates.\n\nFull BLAKE3 Hashing: Verifies matches with high-performance 128KB buffering.",
-    help_template = "{before-help}{name} {version}\n{author-with-newline}{about-section}\n\nSTORAGE PATHS:\n  State DB: ~/.bdstorage/state.redb\n  CAS Vault: ~/.bdstorage/store\n\n{usage-heading} {usage}\n\nGLOBAL FLAGS:\n  -h, --help     Print help\n  -V, --version  Print version\n\nSUBCOMMAND FLAGS:\n  --paranoid     Available on the dedupe subcommand. Forces a byte-for-byte\n                 verification before linking to guarantee 100% collision safety.\n\n  -n, --dry-run  Available on dedupe and restore subcommands. Simulates operations\n                 without modifying the filesystem or the database.\n\n{all-args}{after-help}"
+    help_template = "{before-help}{name} {version}\n{author-with-newline}{about-section}\n\nSTORAGE PATHS:\n  State DB: ~/.bdstorage/state.redb\n  CAS Vault: ~/.bdstorage/store\n\n{usage-heading} {usage}\n\nGLOBAL FLAGS:\n  -h, --help     Print help\n  -V, --version  Print version\n\nSUBCOMMAND FLAGS:\n  --paranoid                 Available on the dedupe subcommand. Forces a byte-for-byte\n                             verification before linking to guarantee 100% collision safety.\n\n  --allow-unsafe-hardlinks   Available on the dedupe subcommand. Allows hard link fallback\n                             when CoW reflinks are not supported. WARNING: Hard links share\n                             the same inode. Modifying one file will affect all linked copies\n                             and the vault master.\n\n  -n, --dry-run              Available on dedupe and restore subcommands. Simulates operations\n                             without modifying the filesystem or the database.\n\n{all-args}{after-help}"
 )]
 struct Args {
     #[command(subcommand)]
@@ -54,11 +54,16 @@ enum Commands {
         /// Simulate operations without modifying the filesystem or database.
         #[arg(long, short = 'n')]
         dry_run: bool,
+        /// Allow unsafe hard links as fallback when CoW reflinks are not supported.
+        /// WARNING: Hard links share the same inode without CoW semantics. Modifying
+        /// one file will affect all linked copies and the vault master.
+        #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = false)]
+        allow_unsafe_hardlinks: bool,
     },
     /// Restore deduplicated files to their original independent state.
     ///
     /// Breaks links and copies data back from the vault to the original location.
-    /// If a vault file's reference count hits zero, it is pruned.
+    ///    cargo run -- dedupe ~/Desktop/experiment/ --help    cargo run -- dedupe ~/Desktop/experiment/ --help If a vault file's reference count hits zero, it is pruned.
     Restore {
         /// The directory to restore
         path: PathBuf,
@@ -84,9 +89,9 @@ fn run() -> Result<()> {
             let groups = scan_pipeline(&path, &state)?;
             print_summary("scan", &groups);
         }
-        Commands::Dedupe { path, paranoid, dry_run } => {
+        Commands::Dedupe { path, paranoid, dry_run, allow_unsafe_hardlinks } => {
             let groups = scan_pipeline(&path, &state)?;
-            dedupe_groups(&groups, &state, paranoid, dry_run)?;
+            dedupe_groups(&groups, &state, paranoid, dry_run, allow_unsafe_hardlinks)?;
             print_summary("dedupe", &groups);
         }
         Commands::Restore { path, dry_run } => {
@@ -241,7 +246,32 @@ fn dedupe_groups(
     state: &state::State,
     paranoid: bool,
     dry_run: bool,
+    allow_unsafe_hardlinks: bool,
 ) -> Result<()> {
+    let mut reflink_warning_shown = false;
+    let mut warn_reflink_unsupported = |name: &str| {
+        if !reflink_warning_shown {
+            println!("\n{}", "━".repeat(80).yellow());
+            println!("{} Filesystem Does Not Support Copy-on-Write Reflinks", "[WARNING]".bold().yellow());
+            println!("{}", "━".repeat(80).yellow());
+            println!("\nYour filesystem does not support CoW (Copy-on-Write) reflinks.");
+            println!("Reflinks allow files to share disk space while remaining independent copies.");
+            println!("When you modify a reflinked file, only the changed portions use new disk space.\n");
+            println!("{}", "Why this matters:".bold());
+            println!("  • Reflinks are SAFE - editing one file doesn't affect others");
+            println!("  • Hard links share the SAME inode - editing one file changes ALL copies");
+            println!("  • With hard links, modifying any deduplicated file will corrupt your vault\n");
+            println!("{}", "Your options:".bold());
+            println!("  1. {} - Files will be skipped (current behavior)", "Do nothing".green());
+            println!("  2. {} - Use hard links at your own risk", "Add --allow-unsafe-hardlinks".yellow());
+            println!("  3. {} - Btrfs, XFS (Linux), APFS (macOS), ReFS (Windows)\n", "Switch to a reflink-capable filesystem".cyan());
+            println!("{}", "━".repeat(80).yellow());
+            println!();
+            reflink_warning_shown = true;
+        }
+        println!("{} {}", "[SKIPPED]".bold().red(), name);
+    };
+    
     for (hash, paths) in groups {
         if paths.len() < 2 {
             continue;
@@ -290,38 +320,50 @@ fn dedupe_groups(
         
         // Handle master file replacement (or dry-run simulation)
         if !dry_run {
-            if let Some(link_type) = dedupe::replace_with_link(&vault_path, master)? {
-                if link_type == dedupe::LinkType::HardLink {
-                    let inode = std::fs::metadata(master)?.ino();
-                    state.mark_inode_vaulted(inode)?;
+            match dedupe::replace_with_link(&vault_path, master, allow_unsafe_hardlinks) {
+                Ok(Some(link_type)) => {
+                    if link_type == dedupe::LinkType::HardLink {
+                        let inode = std::fs::metadata(master)?.ino();
+                        state.mark_inode_vaulted(inode)?;
+                    }
+                    if !is_temp_file(master) {
+                        let name = display_name(master);
+                        match link_type {
+                            dedupe::LinkType::Reflink => {
+                                if paranoid && master_verified {
+                                    println!(
+                                        "{} {} {}",
+                                        "[REFLINK ]".bold().green(),
+                                        "[VERIFIED]".bold().blue(),
+                                        name
+                                    );
+                                } else {
+                                    println!("{} {}", "[REFLINK ]".bold().green(), name);
+                                }
+                            }
+                            dedupe::LinkType::HardLink => {
+                                if paranoid && master_verified {
+                                    println!(
+                                        "{} {} {}",
+                                        "[HARDLINK]".bold().yellow(),
+                                        "[VERIFIED]".bold().blue(),
+                                        name
+                                    );
+                                } else {
+                                    println!("{} {}", "[HARDLINK]".bold().yellow(), name);
+                                }
+                            }
+                        }
+                    }
                 }
-                if !is_temp_file(master) {
-                    let name = display_name(master);
-                    match link_type {
-                        dedupe::LinkType::Reflink => {
-                            if paranoid && master_verified {
-                                println!(
-                                    "{} {} {}",
-                                    "[REFLINK ]".bold().green(),
-                                    "[VERIFIED]".bold().blue(),
-                                    name
-                                );
-                            } else {
-                                println!("{} {}", "[REFLINK ]".bold().green(), name);
-                            }
-                        }
-                        dedupe::LinkType::HardLink => {
-                            if paranoid && master_verified {
-                                println!(
-                                    "{} {} {}",
-                                    "[HARDLINK]".bold().yellow(),
-                                    "[VERIFIED]".bold().blue(),
-                                    name
-                                );
-                            } else {
-                                println!("{} {}", "[HARDLINK]".bold().yellow(), name);
-                            }
-                        }
+                Ok(None) => {}
+                Err(e) => {
+                    if e.to_string().contains("reflink not supported") {
+                        let name = display_name(master);
+                        warn_reflink_unsupported(&name);
+                        continue;
+                    } else {
+                        return Err(e);
                     }
                 }
             }
@@ -357,38 +399,50 @@ fn dedupe_groups(
             }
             
             if !dry_run {
-                if let Some(link_type) = dedupe::replace_with_link(&vault_path, path)? {
-                    if link_type == dedupe::LinkType::HardLink {
-                        let inode = std::fs::metadata(path)?.ino();
-                        state.mark_inode_vaulted(inode)?;
+                match dedupe::replace_with_link(&vault_path, path, allow_unsafe_hardlinks) {
+                    Ok(Some(link_type)) => {
+                        if link_type == dedupe::LinkType::HardLink {
+                            let inode = std::fs::metadata(path)?.ino();
+                            state.mark_inode_vaulted(inode)?;
+                        }
+                        if !is_temp_file(path) {
+                            let name = display_name(path);
+                            match link_type {
+                                dedupe::LinkType::Reflink => {
+                                    if paranoid && verified {
+                                        println!(
+                                            "{} {} {}",
+                                            "[REFLINK ]".bold().green(),
+                                            "[VERIFIED]".bold().blue(),
+                                            name
+                                        );
+                                    } else {
+                                        println!("{} {}", "[REFLINK ]".bold().green(), name);
+                                    }
+                                }
+                                dedupe::LinkType::HardLink => {
+                                    if paranoid && verified {
+                                        println!(
+                                            "{} {} {}",
+                                            "[HARDLINK]".bold().yellow(),
+                                            "[VERIFIED]".bold().blue(),
+                                            name
+                                        );
+                                    } else {
+                                        println!("{} {}", "[HARDLINK]".bold().yellow(), name);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if !is_temp_file(path) {
-                        let name = display_name(path);
-                        match link_type {
-                            dedupe::LinkType::Reflink => {
-                                if paranoid && verified {
-                                    println!(
-                                        "{} {} {}",
-                                        "[REFLINK ]".bold().green(),
-                                        "[VERIFIED]".bold().blue(),
-                                        name
-                                    );
-                                } else {
-                                    println!("{} {}", "[REFLINK ]".bold().green(), name);
-                                }
-                            }
-                            dedupe::LinkType::HardLink => {
-                                if paranoid && verified {
-                                    println!(
-                                        "{} {} {}",
-                                        "[HARDLINK]".bold().yellow(),
-                                        "[VERIFIED]".bold().blue(),
-                                        name
-                                    );
-                                } else {
-                                    println!("{} {}", "[HARDLINK]".bold().yellow(), name);
-                                }
-                            }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if e.to_string().contains("reflink not supported") {
+                            let name = display_name(path);
+                            warn_reflink_unsupported(&name);
+                            continue;
+                        } else {
+                            return Err(e);
                         }
                     }
                 }

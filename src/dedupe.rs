@@ -35,7 +35,7 @@ impl Drop for TempCleanup {
     }
 }
 
-pub fn replace_with_link(master: &Path, target: &Path) -> Result<Option<LinkType>> {
+pub fn replace_with_link(master: &Path, target: &Path, allow_unsafe_hardlinks: bool) -> Result<Option<LinkType>> {
     if master == target {
         return Ok(None);
     }
@@ -58,10 +58,17 @@ pub fn replace_with_link(master: &Path, target: &Path) -> Result<Option<LinkType
             if temp.exists() {
                 let _ = std::fs::remove_file(&temp);
             }
-            std::fs::hard_link(master, &temp).with_context(|| "create hard link")?;
-            std::fs::rename(&temp, target).with_context(|| "replace target with hard link")?;
-            cleanup.disarm();
-            Ok(Some(LinkType::HardLink))
+            
+            if allow_unsafe_hardlinks {
+                // User explicitly opted into unsafe hardlinks
+                std::fs::hard_link(master, &temp).with_context(|| "create hard link")?;
+                std::fs::rename(&temp, target).with_context(|| "replace target with hard link")?;
+                cleanup.disarm();
+                Ok(Some(LinkType::HardLink))
+            } else {
+                // Safety first: refuse to create hardlinks without explicit permission
+                anyhow::bail!("reflink not supported on this filesystem and --allow-unsafe-hardlinks not specified")
+            }
         }
     }
 }
