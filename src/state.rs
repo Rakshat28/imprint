@@ -14,12 +14,45 @@ pub struct State {
 
 impl State {
     pub fn open_default() -> Result<Self> {
+        Self::open_default_impl(false)
+    }
+
+    pub fn open_readonly_if_exists() -> Result<Self> {
+        let db_path = default_db_path()?;
+        if !db_path.exists() {
+            return Self::create_dummy();
+        }
+        Self::open_default_impl(true)
+    }
+
+    fn create_dummy() -> Result<Self> {
+        let temp_dir = std::env::temp_dir().join(format!("bdstorage-dry-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("dummy.redb");
+        let db = Database::create(&db_path)?;
+        let txn = db.begin_write()?;
+        {
+            let _ = txn.open_table(FILE_INDEX)?;
+            let _ = txn.open_table(CAS_INDEX)?;
+            let _ = txn.open_table(VAULTED_INODES)?;
+        }
+        txn.commit()?;
+        Ok(Self {
+            db: std::sync::Arc::new(db),
+        })
+    }
+
+    fn open_default_impl(readonly: bool) -> Result<Self> {
         let db_path = default_db_path()?;
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create state directory {:?}", parent))?;
         }
-        let db = Database::create(&db_path).with_context(|| "open redb database")?;
+        let db = if readonly {
+            Database::open(&db_path).with_context(|| "open redb database")?
+        } else {
+            Database::create(&db_path).with_context(|| "open redb database")?
+        };
         let txn = db
             .begin_write()
             .with_context(|| "begin write transaction")?;

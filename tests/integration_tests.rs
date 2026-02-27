@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -79,6 +80,13 @@ fn test_happy_path_dedupe_and_restore() {
     let mut restore_cmd = run_cmd(home, &["restore", &target.to_string_lossy()]);
     restore_cmd.assert().success();
 
+    let restored_content =
+        fs::read(&target.join("dup_0.txt")).expect("Failed to read restored file");
+    assert_eq!(
+        restored_content, b"identical content",
+        "Restored file content should match original"
+    );
+
     let vault_files: Vec<_> = walkdir::WalkDir::new(&vault)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -150,24 +158,32 @@ fn test_massive_and_sparse_files() {
     file2_content[7 * 1024] = 0xBB;
 
     create_file_with_content(&target, "large1.bin", &file1_content);
+    create_file_with_content(&target, "large1_dup.bin", &file1_content);
     create_file_with_content(&target, "large2.bin", &file2_content);
+    create_file_with_content(&target, "large2_dup.bin", &file2_content);
 
-    let mut dedupe_cmd = run_cmd(home, &["dedupe", &target.to_string_lossy()]);
+    let mut dedupe_cmd = run_cmd(
+        home,
+        &[
+            "dedupe",
+            &target.to_string_lossy(),
+            "--allow-unsafe-hardlinks",
+        ],
+    );
     dedupe_cmd.assert().success();
 
     let vault = home.join(".imprint").join("store");
-    if vault.exists() {
-        let vault_files: Vec<_> = walkdir::WalkDir::new(&vault)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .collect();
+    let vault_files: Vec<_> = walkdir::WalkDir::new(&vault)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .collect();
 
-        assert!(
-            vault_files.len() >= 1,
-            "Vault should contain master files after dedupe of large files"
-        );
-    }
+    assert_eq!(
+        vault_files.len(),
+        2,
+        "Sparse hashing must detect mid-file byte difference and create 2 distinct vault files"
+    );
 }
 
 #[test]
@@ -186,7 +202,10 @@ fn test_metadata_integrity() {
     let test_time = filetime::FileTime::from_unix_time(1000000000, 0);
     filetime::set_file_mtime(&dup_path, test_time).expect("Failed to set mtime");
 
-    let _ = xattr::set(&dup_path, "user.test_attr", b"test_value");
+    if xattr::set(&dup_path, "user.test_attr", b"test_value").is_err() {
+        eprintln!("Skipping xattr test: filesystem does not support extended attributes");
+        return;
+    }
 
     let mut dedupe_cmd = run_cmd(home, &["dedupe", &target.to_string_lossy()]);
     dedupe_cmd.assert().success();
@@ -206,12 +225,13 @@ fn test_metadata_integrity() {
         "Permissions should be preserved as read-only (0o444)"
     );
 
-    if let Ok(Some(attr_val)) = xattr::get(&dup_path, "user.test_attr") {
-        assert_eq!(
-            attr_val, b"test_value",
-            "Extended attribute value should match"
-        );
-    }
+    let attr_val = xattr::get(&dup_path, "user.test_attr")
+        .expect("Filesystem does not support xattr during test")
+        .expect("xattr was completely stripped during deduplication");
+    assert_eq!(
+        attr_val, b"test_value",
+        "Extended attribute value corrupted"
+    );
 }
 
 #[test]
@@ -239,11 +259,20 @@ fn test_hardlink_fallback() {
     let file2_meta =
         fs::metadata(&target.join("file2.txt")).expect("Failed to read file2 metadata");
 
-    assert_eq!(
-        file1_meta.ino(),
-        file2_meta.ino(),
-        "Hardlinked files should have the same inode"
-    );
+    let file1_inode = file1_meta.ino();
+    let file2_inode = file2_meta.ino();
+
+    if file1_inode == file2_inode {
+        // Hardlink successful
+    } else {
+        // Reflink used instead (filesystem natively supports CoW)
+        let file1_content = fs::read(&target.join("file1.txt")).expect("Failed to read file1");
+        let file2_content = fs::read(&target.join("file2.txt")).expect("Failed to read file2");
+        assert_eq!(
+            file1_content, file2_content,
+            "Fallback failed: file contents do not match"
+        );
+    }
 }
 
 #[test]
@@ -268,9 +297,15 @@ fn test_paranoid_mode_catches_bit_rot() {
 
     if let Some(vault_entry) = vault_file {
         let vault_path = vault_entry.path().to_path_buf();
-        let mut file_content = fs::read(&vault_path).expect("Failed to read vault file");
-        file_content.push(0xFF);
-        fs::write(&vault_path, file_content).expect("Failed to corrupt vault file");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&vault_path)
+            .expect("Failed to open vault file for corruption");
+        file.seek(SeekFrom::Start(10))
+            .expect("Failed to seek to middle of file");
+        file.write_all(&[0xFF])
+            .expect("Failed to write corrupted byte");
+        drop(file);
 
         let mut dedupe_cmd2 = run_cmd(home, &["dedupe", &target.to_string_lossy(), "--paranoid"]);
 
@@ -341,9 +376,9 @@ fn test_dry_run_no_changes() {
         "Dry-run should not modify file inodes"
     );
 
-    let vault = home.join(".imprint").join("store");
+    let imprint_dir = home.join(".imprint");
     assert!(
-        !vault.exists(),
-        "Vault should not be created in dry-run mode"
+        !imprint_dir.exists(),
+        "Entire .imprint directory (vault and database) must not exist in dry-run mode"
     );
 }

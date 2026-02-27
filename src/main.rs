@@ -60,10 +60,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    let state = state::State::open_default()?;
 
     match args.command {
         Commands::Scan { path } => {
+            let state = state::State::open_default()?;
             let groups = scan_pipeline(&path, &state)?;
             print_summary("scan", &groups);
         }
@@ -73,11 +73,21 @@ fn run() -> Result<()> {
             dry_run,
             allow_unsafe_hardlinks,
         } => {
+            let state = if dry_run {
+                state::State::open_readonly_if_exists()?
+            } else {
+                state::State::open_default()?
+            };
             let groups = scan_pipeline(&path, &state)?;
             dedupe_groups(&groups, &state, paranoid, dry_run, allow_unsafe_hardlinks)?;
             print_summary("dedupe", &groups);
         }
         Commands::Restore { path, dry_run } => {
+            let state = if dry_run {
+                state::State::open_readonly_if_exists()?
+            } else {
+                state::State::open_default()?
+            };
             restore_pipeline(&path, &state, dry_run)?;
         }
     }
@@ -120,25 +130,25 @@ fn scan_pipeline(path: &Path, state: &state::State) -> Result<HashMap<Hash, Vec<
             while let Ok(file_path) = rx.recv() {
                 if let Ok(metadata) = std::fs::metadata(&file_path) {
                     let inode = metadata.ino();
-                    if let Ok(is_vaulted) = state_ref.is_inode_vaulted(inode) {
-                        if is_vaulted {
-                            continue;
-                        }
+                    if let Ok(is_vaulted) = state_ref.is_inode_vaulted(inode)
+                        && is_vaulted
+                    {
+                        continue;
                     }
 
                     let size = metadata.len();
-                    if let Ok(_) = hasher::sparse_hash(&file_path, size) {
-                        if let Ok(full_hash) = hasher::full_hash(&file_path) {
-                            let modified = file_modified(&file_path).unwrap_or(0);
-                            let file_metadata = FileMetadata {
-                                size,
-                                modified,
-                                hash: full_hash,
-                            };
-                            let _ = state_ref.upsert_file(&file_path, &file_metadata);
-                            let _ = tx.send((full_hash, file_path));
-                            hash_bar_clone.inc(1);
-                        }
+                    if let Ok(_) = hasher::sparse_hash(&file_path, size)
+                        && let Ok(full_hash) = hasher::full_hash(&file_path)
+                    {
+                        let modified = file_modified(&file_path).unwrap_or(0);
+                        let file_metadata = FileMetadata {
+                            size,
+                            modified,
+                            hash: full_hash,
+                        };
+                        let _ = state_ref.upsert_file(&file_path, &file_metadata);
+                        let _ = tx.send((full_hash, file_path));
+                        hash_bar_clone.inc(1);
                     }
                 }
             }
@@ -149,31 +159,24 @@ fn scan_pipeline(path: &Path, state: &state::State) -> Result<HashMap<Hash, Vec<
 
     let mut size_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
 
-    loop {
-        match scan_rx.recv() {
-            Ok(file_path) => {
-                scan_spinner.tick();
+    while let Ok(file_path) = scan_rx.recv() {
+        scan_spinner.tick();
 
-                if let Ok(metadata) = std::fs::metadata(&file_path) {
-                    let size = metadata.len();
-                    let entry = size_map.entry(size).or_default();
-                    let len_before = entry.len();
-                    entry.push(file_path.clone());
+        if let Ok(metadata) = std::fs::metadata(&file_path) {
+            let size = metadata.len();
+            let entry = size_map.entry(size).or_default();
+            let len_before = entry.len();
+            entry.push(file_path.clone());
 
-                    if len_before == 1 {
-                        if let Some(first_file) = entry.get(0).cloned() {
-                            let _ = hash_task_tx.send(first_file);
-                        }
-                        let _ = hash_task_tx.send(file_path);
-                        hash_bar.set_length(hash_bar.length().unwrap_or(0) + 2);
-                    } else if len_before > 1 {
-                        let _ = hash_task_tx.send(file_path);
-                        hash_bar.set_length(hash_bar.length().unwrap_or(0) + 1);
-                    }
+            if len_before == 1 {
+                if let Some(first_file) = entry.first().cloned() {
+                    let _ = hash_task_tx.send(first_file);
                 }
-            }
-            Err(_) => {
-                break;
+                let _ = hash_task_tx.send(file_path);
+                hash_bar.set_length(hash_bar.length().unwrap_or(0) + 2);
+            } else if len_before > 1 {
+                let _ = hash_task_tx.send(file_path);
+                hash_bar.set_length(hash_bar.length().unwrap_or(0) + 1);
             }
         }
     }
@@ -541,13 +544,12 @@ fn restore_pipeline(path: &Path, state: &state::State, dry_run: bool) -> Result<
             if let Ok(Some(file_meta)) = state.get_file_metadata(&file_path) {
                 target_hash = Some(file_meta.hash);
             }
-        } else if let Ok(Some(file_meta)) = state.get_file_metadata(&file_path) {
-            if let Ok(vault_path) = vault::shard_path(&file_meta.hash) {
-                if vault_path.exists() {
-                    needs_restore = true;
-                    target_hash = Some(file_meta.hash);
-                }
-            }
+        } else if let Ok(Some(file_meta)) = state.get_file_metadata(&file_path)
+            && let Ok(vault_path) = vault::shard_path(&file_meta.hash)
+            && vault_path.exists()
+        {
+            needs_restore = true;
+            target_hash = Some(file_meta.hash);
         }
 
         if needs_restore {
@@ -565,36 +567,33 @@ fn restore_pipeline(path: &Path, state: &state::State, dry_run: bool) -> Result<
                 }
                 restored_count += 1;
                 bytes_restored += size;
-            } else {
-                if dedupe::restore_file(&file_path).is_ok() {
-                    println!("{} {}", "[RESTORED]".bold().cyan(), name);
+            } else if dedupe::restore_file(&file_path).is_ok() {
+                println!("{} {}", "[RESTORED]".bold().cyan(), name);
 
-                    let _ = state.unmark_inode_vaulted(inode);
-                    let _ = state.remove_file_from_index(&file_path);
+                let _ = state.unmark_inode_vaulted(inode);
+                let _ = state.remove_file_from_index(&file_path);
 
-                    if let Some(hash) = target_hash {
-                        if let Ok(mut current_refcount) = state.get_cas_refcount(&hash) {
-                            if current_refcount > 0 {
-                                current_refcount -= 1;
-                                if current_refcount == 0 {
-                                    let _ = vault::remove_from_vault(&hash);
-                                    let _ = state.remove_cas_refcount(&hash);
-                                    println!(
-                                        "{}    -> Vault copy pruned (refcount 0)",
-                                        "[GC]".bold().magenta()
-                                    );
-                                } else {
-                                    let _ = state.set_cas_refcount(&hash, current_refcount);
-                                }
-                            }
-                        }
+                if let Some(hash) = target_hash
+                    && let Ok(mut current_refcount) = state.get_cas_refcount(&hash)
+                    && current_refcount > 0
+                {
+                    current_refcount -= 1;
+                    if current_refcount == 0 {
+                        let _ = vault::remove_from_vault(&hash);
+                        let _ = state.remove_cas_refcount(&hash);
+                        println!(
+                            "{}    -> Vault copy pruned (refcount 0)",
+                            "[GC]".bold().magenta()
+                        );
+                    } else {
+                        let _ = state.set_cas_refcount(&hash, current_refcount);
                     }
-
-                    restored_count += 1;
-                    bytes_restored += size;
-                } else {
-                    eprintln!("{} Failed to restore {name}", "[ERROR]".bold().red());
                 }
+
+                restored_count += 1;
+                bytes_restored += size;
+            } else {
+                eprintln!("{} Failed to restore {name}", "[ERROR]".bold().red());
             }
         }
     }
