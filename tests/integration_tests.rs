@@ -207,7 +207,10 @@ fn test_metadata_integrity() {
     );
 
     if let Ok(Some(attr_val)) = xattr::get(&dup_path, "user.test_attr") {
-        assert_eq!(attr_val, b"test_value", "Extended attribute value should match");
+        assert_eq!(
+            attr_val, b"test_value",
+            "Extended attribute value should match"
+        );
     }
 }
 
